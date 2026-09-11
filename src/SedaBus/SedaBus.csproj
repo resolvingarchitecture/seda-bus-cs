@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Ra.SedaBus</RootNamespace>
+    <AssemblyName>Ra.SedaBus</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Ra.SedaBus</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Brian Taylor</Authors>
+    <Description>A small, broker-less, staged (SEDA-style) message bus for C#.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/resolvingarchitecture/seda-bus-cs</RepositoryUrl>
+    <PackageTags>seda;message-bus;staged;concurrency;resolving-architecture</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\..\common\ra-common-cs\src\RaCommon\RaCommon.csproj" />
+  </ItemGroup>
+
+</Project>
