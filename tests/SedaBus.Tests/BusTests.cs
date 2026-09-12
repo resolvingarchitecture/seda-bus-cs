@@ -221,4 +221,83 @@ public class BusTests
             Assert.Equal(3000, seen.Distinct().Count());
         }
     }
+
+    [Fact]
+    public void BlockBackpressureNoLostWakeupUnderSaturation()
+    {
+        // Deliberately tiny capacity + untimed Block: forces every producer
+        // to wait on almost every publish, hammering the exact class of
+        // race a queue redesign risks reintroducing - a producer
+        // registering as a waiter a moment too late to see a slot a
+        // concurrent Poll() already freed, with that Poll() having already
+        // decided (no waiters registered yet) not to pulse anyone. Bounded
+        // by an explicit deadline rather than a bare Join(), so a
+        // regression hangs this test loudly instead of the whole suite
+        // silently.
+        var bus = new Bus(4);
+        var seenLock = new object();
+        var seen = new List<int>();
+        bus.Channel("tight", Cfg().WithCapacity(2).WithConcurrency(2).WithBackpressure(Backpressure.Block));
+        bus.Subscribe("tight", e =>
+        {
+            var n = EnvelopePayload(e)!.GetValue<int>();
+            lock (seenLock) seen.Add(n);
+            return true;
+        });
+
+        var done = 0;
+        var threads = new List<Thread>();
+        for (var b = 0; b < 6; b++)
+        {
+            var basis = b;
+            var t = new Thread(() =>
+            {
+                for (var i = 0; i < 300; i++)
+                {
+                    var n = basis * 1000 + i;
+                    // Untimed Block (no timeout) - exactly the path being tested.
+                    Assert.True(bus.Publish(MakeEnvelope("tight", n)));
+                }
+                Interlocked.Increment(ref done);
+            });
+            threads.Add(t);
+            t.Start();
+        }
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (Volatile.Read(ref done) < 6 && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(20);
+        }
+        Assert.True(Volatile.Read(ref done) == 6,
+            "a producer never returned from an untimed Block publish - lost wakeup");
+        foreach (var t in threads) t.Join();
+        Assert.True(bus.Shutdown(TimeSpan.FromSeconds(15)));
+
+        lock (seenLock)
+        {
+            Assert.Equal(1800, seen.Count);
+            Assert.Equal(1800, seen.Distinct().Count());
+        }
+    }
+
+    [Fact]
+    public void ShutdownReleasesThreadPoolFloorBackDown()
+    {
+        // Found by an independent production-readiness audit: the
+        // constructor used to raise ThreadPool's process-wide min-thread
+        // floor and nothing ever lowered it again, even after this same
+        // Bus's own Shutdown - a real leak across repeated create/dispose
+        // cycles. Proven here by round-tripping a large, unambiguous raise.
+        ThreadPool.GetMinThreads(out var before, out _);
+        var bus = new Bus(before + 50);
+        ThreadPool.GetMinThreads(out var raised, out _);
+        Assert.True(raised >= before + 50);
+
+        bus.Shutdown(TimeSpan.FromSeconds(2));
+
+        ThreadPool.GetMinThreads(out var after, out _);
+        Assert.True(after <= before,
+            $"expected the pool floor to return to at most {before} after Shutdown, was {after}");
+    }
 }

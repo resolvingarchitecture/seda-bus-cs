@@ -90,6 +90,17 @@ public sealed class Bus
 
     private volatile bool _running = true;
     private volatile bool _accepting = true;
+    private bool _poolFloorReleased;
+
+    // The process-wide ThreadPool floor is a single global setting, not a
+    // per-instance one — every live Bus in the process contends for it, and
+    // it's a real, found-by-audit resource leak if nothing ever lowers it
+    // back down. See RaisePoolFloor's own comment.
+    private static readonly object PoolFloorLock = new();
+    private static readonly Dictionary<Bus, int> ActivePoolFloorRequests = new();
+    private static bool _poolFloorBaselineCaptured;
+    private static int _poolFloorBaselineMinWorker;
+    private static int _poolFloorBaselineMinIo;
 
     /// <summary>
     /// Create and start a bus. <paramref name="workers"/> raises the shared
@@ -103,11 +114,56 @@ public sealed class Bus
     public Bus(int workers = 0)
     {
         Workers = workers > 0 ? workers : Environment.ProcessorCount;
-        ThreadPool.GetMinThreads(out var minWorker, out var minIo);
-        ThreadPool.SetMinThreads(Math.Max(minWorker, Workers), minIo);
+        RaisePoolFloor();
     }
 
     public int Workers { get; }
+
+    // Found by an independent production-readiness audit: the constructor
+    // used to call ThreadPool.SetMinThreads directly and nothing ever
+    // called it again, so the floor only ever ratcheted up — across
+    // repeated create-and-dispose cycles of a single Bus, or multiple
+    // concurrent ones, it never came back down. Fixed by tracking each live
+    // Bus's own requested floor and recomputing the applied value as the
+    // max across every currently-live request (falling back to the
+    // pre-any-Bus baseline once none are left) — releasing one bus's
+    // request, in Shutdown/ShutdownNow, lowers the floor back toward what
+    // the others still need instead of leaking it forever.
+    private void RaisePoolFloor()
+    {
+        lock (PoolFloorLock)
+        {
+            if (!_poolFloorBaselineCaptured)
+            {
+                ThreadPool.GetMinThreads(out _poolFloorBaselineMinWorker, out _poolFloorBaselineMinIo);
+                _poolFloorBaselineCaptured = true;
+            }
+            ActivePoolFloorRequests[this] = Workers;
+            ApplyPoolFloorLocked();
+        }
+    }
+
+    private void ReleasePoolFloor()
+    {
+        lock (PoolFloorLock)
+        {
+            if (_poolFloorReleased) return;
+            _poolFloorReleased = true;
+            ActivePoolFloorRequests.Remove(this);
+            ApplyPoolFloorLocked();
+        }
+    }
+
+    // Caller must hold PoolFloorLock.
+    private static void ApplyPoolFloorLocked()
+    {
+        var targetWorker = _poolFloorBaselineMinWorker;
+        foreach (var requested in ActivePoolFloorRequests.Values)
+        {
+            if (requested > targetWorker) targetWorker = requested;
+        }
+        ThreadPool.SetMinThreads(targetWorker, _poolFloorBaselineMinIo);
+    }
 
     /// <summary>Register a stage. Re-registering a name is a no-op.</summary>
     public Bus Channel(string name, ChannelConfig? config = null)
@@ -299,6 +355,7 @@ public sealed class Bus
         _accepting = false;
         var drained = AwaitDrain(timeout);
         _running = false;
+        ReleasePoolFloor();
         return drained;
     }
 
@@ -307,6 +364,7 @@ public sealed class Bus
     {
         _accepting = false;
         _running = false;
+        ReleasePoolFloor();
     }
 
     private bool AwaitDrain(TimeSpan timeout)

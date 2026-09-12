@@ -5,21 +5,60 @@ using Ra.Common;
 namespace Ra.SedaBus;
 
 /// <summary>
-/// One stage: a bounded queue plus its consumers. The queue is a
-/// <see cref="LinkedList{T}"/> guarded by a monitor lock (<c>lock</c> +
-/// <see cref="Monitor.Wait(object, TimeSpan)"/>/<see cref="Monitor.Pulse"/> —
-/// .NET's built-in condition-variable equivalent), since it needs both FIFO
-/// admission and LIFO requeue-to-front for retries. Concurrency permits are
-/// a <see cref="SemaphoreSlim"/>, not hand-rolled — .NET, like the JVM, ships
-/// a real one.
+/// One stage: a bounded queue plus its consumers.
+///
+/// The queue is two <see cref="ConcurrentQueue{T}"/> lanes - a lock-free,
+/// BCL-provided MPMC structure, not a single <c>lock</c>-guarded
+/// <see cref="LinkedList{T}"/> shared by every producer and consumer on the
+/// stage (the original design; measured as a real, confirmed lock-contention
+/// cliff under <c>par</c> - <c>p50</c> in the tens of microseconds, <c>p99</c>
+/// jumping 1,000-3,500x, unstable trial-to-trial - see
+/// seda-bus-compare/RESULTS.md). A prior attempt at a hand-rolled two-lock
+/// queue made latency worse, not better, and was reverted; an independent
+/// production-readiness audit's working theory is that it introduced a wait
+/// on a shared .NET ThreadPool thread inside <see cref="Bus"/>'s
+/// <c>Drain</c> work items, which is the one thing that pool punishes
+/// savagely (thread injection is throttled to roughly one new thread per
+/// half-second to a second under sustained demand). This design avoids that
+/// trap structurally: <see cref="Offer"/>'s only blocking wait
+/// (<see cref="Backpressure.Block"/>) runs on the caller's own thread inside
+/// <see cref="Bus.Publish"/>, never inside a <c>Drain</c> ThreadPool work
+/// item - mirroring why the original single-lock design was itself
+/// "accidentally ThreadPool-safe" per that same audit.
+///
+/// Retries (<see cref="Requeue"/>) go in a separate lane, always drained
+/// ahead of fresh admissions - "put a nacked envelope back at the head for
+/// another attempt" without needing a linked list's O(1) front-insert (which
+/// <see cref="ConcurrentQueue{T}"/> doesn't support) or a hand-rolled
+/// capacity-headroom scheme: both lanes are logically unbounded
+/// <see cref="ConcurrentQueue{T}"/>s, and <see cref="Config"/>'s
+/// <see cref="ChannelConfig.Capacity"/> is enforced ourselves, against fresh
+/// admissions only, exactly as every other port in this comparison does
+/// around its own lock-free primitive (Rust's <c>ArrayQueue</c>, C++'s
+/// <c>TwoLockQueue</c>).
+///
+/// Concurrency permits are a <see cref="SemaphoreSlim"/>, not hand-rolled -
+/// .NET, like the JVM, ships a real one.
 /// </summary>
 internal sealed class Channel
 {
     public string Name { get; }
     public ChannelConfig Config { get; }
 
-    private readonly object _lock = new();
-    private readonly LinkedList<Envelope> _queue = new();
+    private readonly ConcurrentQueue<Envelope> _retryQueue = new();
+    private readonly ConcurrentQueue<Envelope> _mainQueue = new();
+
+    // Only touched by a blocked Offer (rare) and Poll's notify when someone
+    // is actually waiting (also rare: this benchmark's capacity is never
+    // exhausted, and neither is most production traffic most of the time).
+    // A plain object + Monitor.Wait/Pulse - .NET's condition-variable
+    // equivalent - not a SemaphoreSlim: gating the Pulse behind _waiters
+    // needs the same lock Offer holds while re-checking capacity, to close
+    // the lost-wakeup race described on Offer below (mirrors the identical
+    // fix applied to seda-bus-rust's Channel).
+    private readonly object _waitLock = new();
+    private int _waiters;
+
     private readonly SemaphoreSlim _permits;
 
     private readonly ReaderWriterLockSlim _consumersLock = new();
@@ -45,10 +84,7 @@ internal sealed class Channel
         _permits = new SemaphoreSlim(config.Concurrency, config.Concurrency);
     }
 
-    public int Depth()
-    {
-        lock (_lock) return _queue.Count;
-    }
+    public int Depth() => _mainQueue.Count + _retryQueue.Count;
 
     /// <summary>
     /// Admit an envelope, honouring the stage's back-pressure policy.
@@ -57,60 +93,109 @@ internal sealed class Channel
     /// </summary>
     public bool Offer(Envelope env, DateTime? deadline)
     {
-        lock (_lock)
+        while (true)
         {
-            while (_queue.Count >= Config.Capacity)
+            if (Depth() < Config.Capacity)
             {
-                if (Config.Backpressure is Backpressure.Reject or Backpressure.DropNewest)
-                {
+                _mainQueue.Enqueue(env);
+                Interlocked.Increment(ref _enqueued);
+                return true;
+            }
+
+            switch (Config.Backpressure)
+            {
+                case Backpressure.Reject:
+                case Backpressure.DropNewest:
                     Interlocked.Increment(ref _dropped);
                     return false;
-                }
-                if (Config.Backpressure == Backpressure.DropOldest)
-                {
-                    _queue.RemoveFirst();
-                    Interlocked.Increment(ref _dropped);
-                    break;
-                }
-                // Block.
-                if (deadline is null)
-                {
-                    Monitor.Wait(_lock);
-                }
-                else
-                {
-                    var remaining = deadline.Value - DateTime.UtcNow;
-                    if (remaining <= TimeSpan.Zero)
+
+                case Backpressure.DropOldest:
+                    if (TryEvictOldest()) Interlocked.Increment(ref _dropped);
+                    continue; // retry the enqueue
+
+                case Backpressure.Block:
+                default:
+                    lock (_waitLock)
                     {
-                        Interlocked.Increment(ref _dropped);
-                        return false;
+                        Interlocked.Increment(ref _waiters);
+                        // Close a lost-wakeup window: a slot can free
+                        // between the lock-free Depth() check above and
+                        // taking _waitLock/registering as a waiter here.
+                        // Poll() only pulses when _waiters > 0 at the
+                        // moment it dequeues; if that dequeue happened
+                        // before we incremented _waiters, no pulse was
+                        // sent and none ever will be for this iteration.
+                        // Re-checking Depth() now, still holding
+                        // _waitLock (the same lock Poll()'s pulse path
+                        // takes), catches that case directly - either the
+                        // freed slot is visible immediately and we retry
+                        // without waiting, or no dequeue has happened yet
+                        // and any dequeue from here on sees _waiters > 0
+                        // and pulses us, since we hold _waitLock
+                        // continuously through to Monitor.Wait below.
+                        if (Depth() < Config.Capacity)
+                        {
+                            Interlocked.Decrement(ref _waiters);
+                            continue;
+                        }
+                        if (deadline is null)
+                        {
+                            Monitor.Wait(_waitLock);
+                        }
+                        else
+                        {
+                            var remaining = deadline.Value - DateTime.UtcNow;
+                            if (remaining <= TimeSpan.Zero)
+                            {
+                                Interlocked.Decrement(ref _waiters);
+                                Interlocked.Increment(ref _dropped);
+                                return false;
+                            }
+                            Monitor.Wait(_waitLock, remaining);
+                        }
+                        Interlocked.Decrement(ref _waiters);
                     }
-                    Monitor.Wait(_lock, remaining);
-                }
+                    continue; // retry; a spurious/timed-out wake just re-checks Depth()
             }
-            _queue.AddLast(env);
-            Interlocked.Increment(ref _enqueued);
-            return true;
         }
     }
 
     public Envelope? Poll()
     {
-        lock (_lock)
+        if (_retryQueue.TryDequeue(out var env))
         {
-            if (_queue.Count == 0) return null;
-            var env = _queue.First!.Value;
-            _queue.RemoveFirst();
-            Monitor.Pulse(_lock);
+            MaybeNotify();
             return env;
         }
+        if (_mainQueue.TryDequeue(out env))
+        {
+            MaybeNotify();
+            return env;
+        }
+        return null;
     }
 
     /// <summary>Put a nacked envelope back at the head for another attempt.</summary>
     public void Requeue(Envelope env)
     {
-        lock (_lock) _queue.AddFirst(env);
+        _retryQueue.Enqueue(env);
+        MaybeNotify();
     }
+
+    private void MaybeNotify()
+    {
+        if (Volatile.Read(ref _waiters) > 0)
+        {
+            lock (_waitLock) Monitor.Pulse(_waitLock);
+        }
+    }
+
+    /// <summary>
+    /// Evicts whatever Poll() would return next (retry lane takes priority,
+    /// same as Poll itself) - "oldest" in the queue's own priority order,
+    /// not necessarily strict arrival order once a retry has jumped the line.
+    /// </summary>
+    private bool TryEvictOldest() => _retryQueue.TryDequeue(out _) || _mainQueue.TryDequeue(out _);
 
     public bool TryAcquire() => _permits.Wait(0);
 
