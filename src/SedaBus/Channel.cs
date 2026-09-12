@@ -79,6 +79,22 @@ internal sealed class Channel
 
     public Channel(string name, ChannelConfig config)
     {
+        // ChannelConfig's fluent With* builder methods clamp every value to
+        // >=1, but ChannelConfig is a public record with public init-only
+        // properties - `new ChannelConfig { Capacity = 0 }` bypasses that
+        // clamping entirely. Found by the correctness suite: a Capacity of
+        // 0 makes Offer's `Depth() < Capacity` check always false, which
+        // under the default Block policy hangs the very first Publish call
+        // forever rather than failing fast. Validating here, independent of
+        // how the config was built, is the single choke point every
+        // Channel construction path (Bus.Channel, Bus.Subscribe's
+        // GetOrCreate, SetDeadLetterChannel) already goes through.
+        if (config.Capacity < 1)
+            throw new ArgumentOutOfRangeException(nameof(config), config.Capacity, "ChannelConfig.Capacity must be at least 1.");
+        if (config.Concurrency < 1)
+            throw new ArgumentOutOfRangeException(nameof(config), config.Concurrency, "ChannelConfig.Concurrency must be at least 1.");
+        if (config.MaxAttempts < 1)
+            throw new ArgumentOutOfRangeException(nameof(config), config.MaxAttempts, "ChannelConfig.MaxAttempts must be at least 1.");
         Name = name;
         Config = config;
         _permits = new SemaphoreSlim(config.Concurrency, config.Concurrency);

@@ -97,6 +97,24 @@ dotnet run --project examples/Pipeline
 
 Targets **.NET 8**.
 
+## Correctness suite coverage
+
+See [`seda-bus/CORRECTNESS_SUITE.md`](../CORRECTNESS_SUITE.md) for what
+C1–C7 mean. All in `tests/SedaBus.Tests/BusTests.cs`.
+
+| # | Property | Test(s) |
+|---|---|---|
+| C1 | Backpressure: Block | `BlockBackpressureNoLostWakeupUnderSaturation` |
+| C1 | Backpressure: Reject | `BackpressureRejectsWhenTheQueueIsFull` |
+| C1 | Backpressure: DropNewest | `DropNewestBehavesLikeReject` |
+| C1 | Backpressure: DropOldest | `DropOldestEvictsInsteadOfRejecting` |
+| C2 | Retry → dead-letter | `NackRetriesThenDeadLetters`, `NackRetriesThenSucceedsOnFinalAttemptWithNoAttemptLeak`, `ChannelWithNoConsumersDeadLettersImmediately` |
+| C3 | Consumer failure isolation | `ThrowingConsumerNacksInsteadOfCrashingTheBus` |
+| C4 | Shutdown accounting | `ShutdownAccountingHoldsUnderConcurrentDelayedProcessing` |
+| C5 | Config validation | `InvalidChannelConfigFailsFastAtConstruction` (fails fast — see `Channel`'s constructor) |
+| C6 | No resource leak | `ShutdownReleasesThreadPoolFloorBackDown` (the specific ThreadPool-floor leak this session fixed), `RepeatedCreateAndShutdownCyclesDoNotLeakThreads` (general guard) |
+| C7 | Concurrency correctness | `ConcurrentProducersDeliverExactlyOnce` |
+
 ## What this is not
 
 SEDA's original design also included a **controller** that watched per-stage
